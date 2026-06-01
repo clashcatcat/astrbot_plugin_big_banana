@@ -38,7 +38,7 @@ PARAMS_LIST = [
 ]
 
 # 提供商配置键列表
-provider_list = ["main_provider", "back_provider", "back_provider2"]
+provider_list = ["main_provider", "back_provider", "back_provider2", "back_provider3", "back_provider4"]
 
 # 部分平台对单张图片大小有限制，超过限制需要作为文件发送
 MAX_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
@@ -83,6 +83,8 @@ class BigBanana(Star):
 
         # 正在运行的任务映射
         self.running_tasks: dict[str, asyncio.Task] = {}
+        # 提供商名称到显示标签的映射
+        self.provider_display_names: dict[str, str] = {}
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -130,6 +132,16 @@ class BigBanana(Star):
                 continue
             # 添加到提供商配置列表
             self.providers_config[provider["api_name"]] = ProviderConfig(**provider)
+            provider_label_map = {
+                "main_provider": "主提供商",
+                "back_provider": "备用提供商1",
+                "back_provider2": "备用提供商2",
+                "back_provider3": "备用提供商3",
+                "back_provider4": "备用提供商4",
+            }
+            self.provider_display_names[provider["api_name"]] = provider_label_map.get(
+                item, provider["api_name"]
+            )
             # 实例化提供商类
             self.provider_map[api_type] = provider_cls(
                 config=self.conf,
@@ -727,7 +739,7 @@ class BigBanana(Star):
         self.running_tasks[task_id] = task
 
         try:
-            results, err_msg = await task
+            results, err_msg, provider_label = await task
             if not results or err_msg:
                 yield event.chain_result(
                     [
@@ -738,7 +750,9 @@ class BigBanana(Star):
                 return
 
             # 组装消息链
-            msg_chain = self.build_message_chain(event, results)
+            msg_chain = self.build_message_chain(
+                event, results, provider_label=provider_label
+            )
 
             yield event.chain_result(msg_chain)
         except asyncio.CancelledError:
@@ -757,7 +771,7 @@ class BigBanana(Star):
         image_urls: list[str] | None = None,
         referer_id: list[str] | None = None,
         is_llm_tool: bool = False,
-    ) -> tuple[list[tuple[str, str]] | None, str | None]:
+    ) -> tuple[list[tuple[str, str]] | None, str | None, str | None]:
         """负责参数处理、调度提供商、保存图片等逻辑，返回图片b64列表或错误信息"""
         # 收集图片URL，后面统一处理
         if image_urls is None:
@@ -858,7 +872,7 @@ class BigBanana(Star):
         if len(image_urls) + len(image_b64_list) < min_required_images:
             warn_msg = f"图片数量不足，最少需要 {min_required_images} 张图片，当前仅 {len(image_urls) + len(image_b64_list)} 张"
             logger.warning(warn_msg)
-            return None, warn_msg
+            return None, warn_msg, None
 
         # 检查图片数量是否超过最大允许数量，不超过则可从url中下载图片
         append_count = max_allowed_images - len(image_b64_list)
@@ -874,8 +888,8 @@ class BigBanana(Star):
 
             # 如果 min_required_images 为 0，列表为空是允许的
             if not image_b64_list and min_required_images > 0:
-                logger.error("全部图片下载失败或者图片格式不支持")
-                return None, "全部图片下载失败或者图片格式不支持"
+                logger.error("全部参考图片下载失败")
+                return None, "全部参考图片下载失败", None
         elif append_count < 0:
             logger.warning(
                 f"参考图片数量超过最大允许数量 {max_allowed_images}，跳过下载图片步骤"
@@ -885,7 +899,7 @@ class BigBanana(Star):
         await event.send(MessageChain().message("🎨 在画了，请稍等一会..."))
 
         # 调度提供商生成图片
-        images_result, err = await self._dispatch(
+        images_result, err, provider_label = await self._dispatch(
             params=params, image_b64_list=image_b64_list
         )
 
@@ -896,19 +910,19 @@ class BigBanana(Star):
             if not err:
                 err = "图片生成失败：响应中未包含图片数据"
                 logger.error(err)
-            return None, err
+            return None, err, provider_label
 
         # 保存图片到本地
         if self.save_images:
             save_images(valid_results, self.save_dir)
 
-        return valid_results, None
+        return valid_results, None, provider_label
 
     async def _dispatch(
         self,
         params: dict,
         image_b64_list: list[tuple[str, str]] | None = None,
-    ) -> tuple[list[tuple[str, str]] | None, str | None]:
+    ) -> tuple[list[tuple[str, str]] | None, str | None, str | None]:
         """提供商调度器"""
         err = None
 
@@ -934,7 +948,14 @@ class BigBanana(Star):
             )
             if images_result:
                 logger.info(f"{provider_config.api_name} 图片生成成功")
-                return images_result, None
+                provider_name = self.provider_display_names.get(
+                    provider_config.api_name, provider_config.api_name
+                )
+                return (
+                    images_result,
+                    None,
+                    f"〔{provider_name}｜{provider_config.model}〕\n",
+                )
             if i < len(active_providers) - 1:
                 logger.warning(
                     f"{provider_config.api_name} 生成图片失败，尝试使用下一个提供商..."
@@ -944,10 +965,13 @@ class BigBanana(Star):
         if len(active_providers) == 0:
             err = "当前无可用提供商，请检查插件配置。"
             logger.error(err)
-        return None, err
+        return None, err, None
 
     def build_message_chain(
-        self, event: AstrMessageEvent, results: list[tuple[str, str]]
+        self,
+        event: AstrMessageEvent,
+        results: list[tuple[str, str]],
+        provider_label: str | None = None,
     ) -> list[BaseMessageComponent]:
         """构建消息链"""
         msg_chain: list[BaseMessageComponent] = [
@@ -960,10 +984,14 @@ class BigBanana(Star):
             save_results = save_images(results, self.temp_dir)
             for name_, path_ in save_results:
                 msg_chain.append(Comp.File(name=name_, file=str(path_)))
+            if provider_label:
+                msg_chain.append(Comp.Plain(f"\n{provider_label}"))
             return msg_chain
 
         # 其他平台直接发送图片
         msg_chain.extend(Comp.Image.fromBase64(b64) for _, b64 in results)
+        if provider_label:
+            msg_chain.append(Comp.Plain(f"\n{provider_label}"))
         return msg_chain
 
     async def terminate(self):

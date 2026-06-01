@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import TYPE_CHECKING, Any
+
+import astrbot.api.message_components as Comp
 
 # from mcp.types import CallToolResult, ContentBlock, ImageContent
 from pydantic import Field
@@ -169,6 +172,67 @@ class BigBananaTool(FunctionTool[AstrAgentContext]):
         }
     )
     # fmt: on
+    async def _send_completion_followup(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+    ) -> None:
+        """读取当前会话历史，让模型补一句完成态回复。"""
+        try:
+            plugin: BigBanana = self.plugin
+            conv_mgr = plugin.context.conversation_manager
+            curr_cid = await conv_mgr.get_curr_conversation_id(event.unified_msg_origin)
+            if not curr_cid:
+                return
+
+            conversation = await conv_mgr.get_conversation(
+                event.unified_msg_origin, curr_cid
+            )
+            if not conversation:
+                return
+
+            contexts = json.loads(conversation.history) if conversation.history else []
+            provider = plugin.context.get_using_provider(event.unified_msg_origin)
+            if not provider:
+                logger.warning("[BIG BANANA] 未获取到当前会话的 provider，跳过补充回复")
+                return
+
+            followup_prompt = (
+                "图片已经生成完成并发送给用户。"
+                "请结合当前对话语气，直接回复用户一句简短自然的话，说明已经画好了，"
+                "并根据本次需求概括一下画面内容。"
+                "只输出最终回复，不要解释过程，不要再次调用工具。\n"
+                f"本次生成提示词参考：{prompt}"
+            )
+
+            llm_resp = await provider.text_chat(
+                prompt=followup_prompt,
+                session_id=event.unified_msg_origin,
+                contexts=contexts,
+                func_tool=None,
+            )
+            if llm_resp.tools_call_name:
+                logger.warning("[BIG BANANA] 补充回复意外触发了工具调用，已忽略")
+                return
+
+            reply_text = llm_resp.completion_text.strip()
+            if not reply_text:
+                return
+
+            await event.send(
+                MessageChain(
+                    chain=[
+                        Comp.Reply(id=event.message_obj.message_id),
+                        Comp.Plain(reply_text),
+                    ]
+                )
+            )
+            logger.info("[BIG BANANA] 已发送基于当前对话历史的补充回复")
+        except json.JSONDecodeError:
+            logger.warning("[BIG BANANA] 当前对话历史解析失败，跳过补充回复")
+        except Exception as e:
+            logger.warning(f"[BIG BANANA] 生成补充回复失败，已跳过: {e}")
+
     async def call(
         self,
         context: ContextWrapper[AstrAgentContext],  # type: ignore
@@ -240,20 +304,21 @@ class BigBananaTool(FunctionTool[AstrAgentContext]):
         task_id = event.message_obj.message_id
         plugin.running_tasks[task_id] = task
         try:
-            results, err_msg = await task
+            results, err_msg, provider_label = await task
             if not results or err_msg:
                 return err_msg or "图片生成失败，未返回任何结果。"
 
             # 组装消息链
             msg_chain: list[BaseMessageComponent] = plugin.build_message_chain(
-                event, results
+                event, results, provider_label=provider_label
             )
             await event.send(MessageChain(chain=msg_chain))
-            # 告知模型图片已发送
-            logger.info("[BIG BANANA] 图片生成成功，已直接发送给用户")
-            return (
-                "图片生成完成，已发送给用户。请直接回复用户消息，禁止重复调用函数工具。"
+            await self._send_completion_followup(
+                event=event,
+                prompt=prompt,
             )
+            logger.info("[BIG BANANA] 图片生成成功，已直接发送给用户")
+            return None
         except asyncio.CancelledError:
             logger.info(f"[BIG BANANA] {task_id} 任务被取消")
             return "图片生成任务被取消"

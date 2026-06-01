@@ -49,39 +49,62 @@ class VertexAIAnonymousProvider(BaseProvider):
         body = self._build_vertex_ai_body(
             provider_config.model, params["prompt"], image_b64_list, params
         )
-        recaptcha_token = await self._get_recaptcha_token()
-        if recaptcha_token is None:
-            return None, "获取 recaptcha_token 失败"
+
         err_msg = None
-        # 记录recaptchaToken的使用次数，测试发现一个recaptchaToken需要在第二次使用时才有效
-        captcha_try_count = 0
-        for i in range(self.vertex_ai_anonymous_config.max_retry):
-            body["variables"]["recaptchaToken"] = recaptcha_token
-            result, status, err_msg = await self._call_api(body)
-            if result is not None:
-                return result, None
-            # 不在最后一次重试时刷新token
-            if i == self.vertex_ai_anonymous_config.max_retry - 1:
-                return None, err_msg or "图片生成失败：重试达到上限。"
-            # 8:资源耗尽；3:Token失效/参数错误
-            if status == 3:
-                if status == 3 and err_msg and "Failed to verify action" in err_msg and captcha_try_count < 1:
-                    captcha_try_count += 1
-                    continue
-                recaptcha_token = await self._get_recaptcha_token()
-                if recaptcha_token is None:
-                    logger.error("[BIG BANANA] 获取 recaptcha_token 失败次数达到上限")
-                    return None, "获取 recaptcha_token 失败"
-                captcha_try_count = 0   # 重置计数器
-            if status == 999:
-                # 这个提供商一但出现内容拦截，重试几乎没有意义，直接返回错误
-                return None, err_msg
-            logger.warning(
-                f"[BIG BANANA] 图片生成失败，正在重试 Vertex AI Anonymous API ({i + 1}/ {self.vertex_ai_anonymous_config.max_retry})"
-            )
-            await asyncio.sleep(self.vertex_ai_anonymous_config.retry_delay)
-        else:
-            return None, err_msg or "图片生成失败：重试达到上限。"
+        max_token_refresh = 10  # 外层循环：定义最多允许重新获取几次全新 Token
+
+        # ================= 外层循环：负责获取和更换 Token =================
+        for token_retry in range(max_token_refresh):
+            recaptcha_token = await self._get_recaptcha_token()
+            if recaptcha_token is None:
+                logger.error(f"[BIG BANANA] 第 {token_retry + 1} 次获取 recaptcha_token 失败")
+                continue  # 如果获取失败，直接重试获取 Token
+
+            captcha_try_count = 0  # 拿到新 Token，重置“二次生效”计数器
+
+            # ================= 内层循环：负责使用当前 Token 请求 API =================
+            for api_retry in range(self.vertex_ai_anonymous_config.max_retry):
+                body["variables"]["recaptchaToken"] = recaptcha_token
+                result, status, err_msg = await self._call_api(body)
+
+                # 成功，直接返回
+                if result is not None:
+                    return result, None
+
+                # 999: 内容被拦截等致命错误，这种换 Token 也没用，直接彻底放弃并返回
+                if status == 999:
+                    return None, err_msg
+
+                # 3: Token相关的报错
+                if status == 3:
+                    if err_msg and "Failed to verify action" in err_msg and captcha_try_count < 1:
+                        # 触发“第二次生效”机制，继续用这个旧 token 重试内层循环
+                        captcha_try_count += 1
+                        logger.warning(
+                            f"[BIG BANANA] 触发 Token 二次生效机制，使用原 Token 重试 ({api_retry + 1}/{self.vertex_ai_anonymous_config.max_retry})"
+                        )
+                        continue
+                    else:
+                        # 真正的 Token 失效（或是二次生效机会用完了依然报 status 3）
+                        # 必须 break 跳出内层循环，去外层拿一个全新的 Token
+                        logger.warning(
+                            f"[BIG BANANA] 当前 Token 已失效，准备获取新 Token... (Token轮次: {token_retry + 1}/{max_token_refresh})"
+                        )
+                        break
+
+                # 其他报错（如网络超时、502等）：带着当前 token 正常重试内层循环
+                logger.warning(
+                    f"[BIG BANANA] 图片生成失败，正在重试 Vertex AI API (Token轮次: {token_retry + 1}/{max_token_refresh}, API重试: {api_retry + 1}/{self.vertex_ai_anonymous_config.max_retry})"
+                )
+
+            else:
+                # 如果内层循环是因为 max_retry 耗尽而正常结束的（没有被 break 打断），
+                # 说明这个 token 网络一直不通或者一直报错，那就去外层换个新 token 试试
+                logger.warning(f"[BIG BANANA] 当前 Token 的 {self.vertex_ai_anonymous_config.max_retry} 次 API 重试机会已耗尽，准备获取新 Token...")
+                continue
+
+        # 如果外层循环也耗尽了，说明彻底失败
+        return None, err_msg or "图片生成失败：Token 重试达到上限。"
 
     async def _call_api(
         self, body: dict
