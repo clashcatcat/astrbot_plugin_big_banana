@@ -34,7 +34,8 @@ PARAMS_LIST = [
     "gather_mode",
     "providers",
     "n",
-    "size"
+    "size",
+    "url",
 ]
 
 # 提供商配置键列表
@@ -739,8 +740,8 @@ class BigBanana(Star):
         self.running_tasks[task_id] = task
 
         try:
-            results, err_msg, provider_label = await task
-            if not results or err_msg:
+            results, err_msg, provider_label, result_urls = await task
+            if err_msg:
                 yield event.chain_result(
                     [
                         Comp.Reply(id=event.message_obj.message_id),
@@ -751,7 +752,11 @@ class BigBanana(Star):
 
             # 组装消息链
             msg_chain = self.build_message_chain(
-                event, results, provider_label=provider_label
+                event,
+                results or [],
+                provider_label=provider_label,
+                result_urls=result_urls,
+                url_only=bool(params.get("url", False)),
             )
 
             yield event.chain_result(msg_chain)
@@ -771,8 +776,8 @@ class BigBanana(Star):
         image_urls: list[str] | None = None,
         referer_id: list[str] | None = None,
         is_llm_tool: bool = False,
-    ) -> tuple[list[tuple[str, str]] | None, str | None, str | None]:
-        """负责参数处理、调度提供商、保存图片等逻辑，返回图片b64列表或错误信息"""
+    ) -> tuple[list[tuple[str, str]] | None, str | None, str | None, list[str] | None]:
+        """负责参数处理、调度提供商、保存图片等逻辑，返回图片、错误信息和可选URL"""
         # 收集图片URL，后面统一处理
         if image_urls is None:
             image_urls = []
@@ -872,7 +877,7 @@ class BigBanana(Star):
         if len(image_urls) + len(image_b64_list) < min_required_images:
             warn_msg = f"图片数量不足，最少需要 {min_required_images} 张图片，当前仅 {len(image_urls) + len(image_b64_list)} 张"
             logger.warning(warn_msg)
-            return None, warn_msg, None
+            return None, warn_msg, None, None
 
         # 检查图片数量是否超过最大允许数量，不超过则可从url中下载图片
         append_count = max_allowed_images - len(image_b64_list)
@@ -889,7 +894,7 @@ class BigBanana(Star):
             # 如果 min_required_images 为 0，列表为空是允许的
             if not image_b64_list and min_required_images > 0:
                 logger.error("全部参考图片下载失败")
-                return None, "全部参考图片下载失败", None
+                return None, "全部参考图片下载失败", None, None
         elif append_count < 0:
             logger.warning(
                 f"参考图片数量超过最大允许数量 {max_allowed_images}，跳过下载图片步骤"
@@ -899,9 +904,14 @@ class BigBanana(Star):
         await event.send(MessageChain().message("🎨 在画了，请稍等一会..."))
 
         # 调度提供商生成图片
-        images_result, err, provider_label = await self._dispatch(
+        images_result, err, provider_label, result_urls = await self._dispatch(
             params=params, image_b64_list=image_b64_list
         )
+
+        if params.get("url", False):
+            if result_urls:
+                return [], None, provider_label, result_urls
+            return None, "当前提供商未返回可用的图片URL", provider_label, None
 
         # 再次检查图片结果是否为空
         valid_results = [(mime, b64) for mime, b64 in (images_result or []) if b64]
@@ -910,19 +920,19 @@ class BigBanana(Star):
             if not err:
                 err = "图片生成失败：响应中未包含图片数据"
                 logger.error(err)
-            return None, err, provider_label
+            return None, err, provider_label, result_urls
 
         # 保存图片到本地
         if self.save_images:
             save_images(valid_results, self.save_dir)
 
-        return valid_results, None, provider_label
+        return valid_results, None, provider_label, result_urls
 
     async def _dispatch(
         self,
         params: dict,
         image_b64_list: list[tuple[str, str]] | None = None,
-    ) -> tuple[list[tuple[str, str]] | None, str | None, str | None]:
+    ) -> tuple[list[tuple[str, str]] | None, str | None, str | None, list[str] | None]:
         """提供商调度器"""
         err = None
 
@@ -946,7 +956,10 @@ class BigBanana(Star):
                 params=params,
                 image_b64_list=image_b64_list,
             )
-            if images_result:
+            provider_result_urls = list(
+                self.provider_map[provider_config.api_type].last_result_urls
+            )
+            if images_result is not None or provider_result_urls:
                 logger.info(f"{provider_config.api_name} 图片生成成功")
                 provider_name = self.provider_display_names.get(
                     provider_config.api_name, provider_config.api_name
@@ -955,6 +968,7 @@ class BigBanana(Star):
                     images_result,
                     None,
                     f"〔{provider_name}｜{provider_config.model}〕\n",
+                    provider_result_urls,
                 )
             if i < len(active_providers) - 1:
                 logger.warning(
@@ -965,18 +979,29 @@ class BigBanana(Star):
         if len(active_providers) == 0:
             err = "当前无可用提供商，请检查插件配置。"
             logger.error(err)
-        return None, err, None
+        return None, err, None, None
 
     def build_message_chain(
         self,
         event: AstrMessageEvent,
         results: list[tuple[str, str]],
         provider_label: str | None = None,
+        result_urls: list[str] | None = None,
+        url_only: bool = False,
     ) -> list[BaseMessageComponent]:
         """构建消息链"""
         msg_chain: list[BaseMessageComponent] = [
             Comp.Reply(id=event.message_obj.message_id)
         ]
+        if url_only:
+            if result_urls:
+                msg_chain.append(
+                    Comp.Plain("\n".join(result_urls))
+                )
+            if provider_label:
+                msg_chain.append(Comp.Plain(f"\n{provider_label}"))
+            return msg_chain
+
         # 对Telegram平台特殊处理，超过10MB的图片需要作为文件发送
         if event.platform_meta.name == "telegram" and any(
             (b64 and len(b64) > MAX_SIZE_B64_LEN) for _, b64 in results

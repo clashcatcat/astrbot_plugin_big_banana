@@ -304,13 +304,17 @@ class BigBananaTool(FunctionTool[AstrAgentContext]):
         task_id = event.message_obj.message_id
         plugin.running_tasks[task_id] = task
         try:
-            results, err_msg, provider_label = await task
-            if not results or err_msg:
+            results, err_msg, provider_label, result_urls = await task
+            if err_msg:
                 return err_msg or "图片生成失败，未返回任何结果。"
 
             # 组装消息链
             msg_chain: list[BaseMessageComponent] = plugin.build_message_chain(
-                event, results, provider_label=provider_label
+                event,
+                results or [],
+                provider_label=provider_label,
+                result_urls=result_urls,
+                url_only=bool(params.get("url", False)),
             )
             await event.send(MessageChain(chain=msg_chain))
             await self._send_completion_followup(
